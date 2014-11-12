@@ -8,6 +8,8 @@ use std::sync::Mutex;
 
 use super::atomic::AtomicConstPtr;
 
+const MAX_HEIGHT: uint = 7;
+
 /// A concurrent, lock-free, linearizable, insert-only, sorted set.
 ///
 /// References:
@@ -20,7 +22,6 @@ pub struct SkipList<T> {
     start: *const Node<T>,
     end: *const Node<T>,
     arena: Mutex<TypedArena<Node<T>>>,
-    max_height: u8,
     branch_factor: u8
 }
 
@@ -28,25 +29,22 @@ impl <T: Ord + Sync + Send> SkipList<T> {
 
     /// Creates a new skip list with the given maximum height and branch factor.
     pub fn new() -> SkipList<T> {
-        SkipList::with_parameters(9, 3)
+        SkipList::with_parameters(4)
     }
 
     /// Creates a new skip list with the given maximum height and branch factor.
-    pub fn with_parameters(max_height: u8, branch_factor: u8) -> SkipList<T> {
-        assert!(max_height > 0, "max_height must be greater than 0.");
+    pub fn with_parameters(branch_factor: u8) -> SkipList<T> {
         assert!(branch_factor > 1, "branch_factor must be greater than 0.");
 
         let arena = TypedArena::new();
         let end: *const Node<T> = arena.alloc(EndSentinel::<T>) as *mut _ as *const _;
-        let succs = Vec::from_fn(max_height as uint, |_| AtomicConstPtr::new(end));
         let start: *const Node<T> =
-            arena.alloc(StartSentinel { succs: succs }) as *mut _ as *const _;
+            arena.alloc(StartSentinel { succs: SkipList::new_succ_array(end) }) as *mut _ as *const _;
 
         SkipList {
             start: start,
             end: end,
             arena: Mutex::new(arena),
-            max_height: max_height,
             branch_factor: branch_factor,
         }
     }
@@ -54,11 +52,11 @@ impl <T: Ord + Sync + Send> SkipList<T> {
     /// Generates a new random height based on the skip list's maximum height and branch factor.
     fn random_height(&self) -> uint {
         let mut level = 1;
-        while level < self.max_height && rand::random::<u8>() % self.branch_factor == 0 {
+        while level < MAX_HEIGHT && rand::random::<u8>() % self.branch_factor == 0 {
             level += 1;
         }
         debug_assert!(level > 0);
-        debug_assert!(level <= self.max_height);
+        debug_assert!(level <= MAX_HEIGHT);
         level as uint
     }
 
@@ -80,10 +78,9 @@ impl <T: Ord + Sync + Send> SkipList<T> {
     ///
     /// `None` is returned if the skip list already contains `elem`.
     fn get_preds(&self, elem: &T) -> Option<Vec<&Node<T>>> {
-        let max_height = self.max_height as uint;
-        let mut preds = Vec::<&Node<T>>::with_capacity(max_height);
+        let mut preds = Vec::<&Node<T>>::with_capacity(MAX_HEIGHT);
         let mut pred = self.start();
-        for height in range(0, max_height).rev() {
+        for height in range(0, MAX_HEIGHT).rev() {
 
             let mut curr = pred.succ(height);
 
@@ -111,9 +108,8 @@ impl <T: Ord + Sync + Send> SkipList<T> {
     /// Returns the node in the skip list for the given element wrapped in `Ok`, or the
     /// next-previous node wrapped in `Err` if the element does not exist in the skip list.
     fn get_or_prev(&self, elem: &T) -> Result<&Node<T>, &Node<T>> {
-        let max_height = self.max_height as uint;
         let mut pred = self.start();
-        for height in range(0, max_height).rev() {
+        for height in range(0, MAX_HEIGHT).rev() {
             let mut curr = pred.succ(height);
             loop {
                 match curr.cmp_elem(elem) {
@@ -152,7 +148,7 @@ impl <T: Ord + Sync + Send> SkipList<T> {
         let elem: &Node<T> = unsafe {
             &*(self.arena.lock().alloc(
                 Element { elem: elem,
-                          succs: Vec::from_fn(top_height, |_| AtomicConstPtr::new(ptr::null())),
+                          succs: SkipList::new_succ_array(ptr::null()),
                 }) as *mut _ as *const _)
         };
 
@@ -231,6 +227,16 @@ impl <T: Ord + Sync + Send> SkipList<T> {
         // This is safe because a skip list's end pointer must be valid for its entire lifetime
         unsafe { &*self.end }
     }
+
+    fn new_succ_array(ptr: *const T) -> [AtomicConstPtr<T>, .. MAX_HEIGHT ] {
+        [ AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr),
+          AtomicConstPtr::new(ptr) ]
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -239,10 +245,10 @@ impl <T: Ord + Sync + Send> SkipList<T> {
 
 enum Node<T> {
     StartSentinel {
-        succs: Vec<AtomicConstPtr<Node<T>>>,
+        succs: [AtomicConstPtr<Node<T>>, .. MAX_HEIGHT],
     },
     Element {
-        succs: Vec<AtomicConstPtr<Node<T>>>,
+        succs: [AtomicConstPtr<Node<T>>, .. MAX_HEIGHT],
         elem: T,
     },
     EndSentinel
@@ -255,7 +261,7 @@ impl <T: Sync + Send> Node<T> {
     /// # Panics
     ///
     /// This method panics if this node is an end sentinel.
-    fn succs(&self) -> &Vec<AtomicConstPtr<Node<T>>> {
+    fn succs(&self) -> &[AtomicConstPtr<Node<T>>, .. MAX_HEIGHT] {
         match *self {
             StartSentinel { ref succs, .. }
             |     Element { ref succs, .. } => succs,
@@ -498,12 +504,11 @@ mod test {
 
     #[quickcheck]
     fn check_set_properties(elements: Vec<int>,
-                            max_height: u8,
                             branch_factor: u8)
                             -> TestResult {
-        if max_height < 1 || branch_factor < 2 { return TestResult::discard() };
+        if branch_factor < 2 { return TestResult::discard() };
 
-        let skip_list = SkipList::with_parameters(max_height, branch_factor);
+        let skip_list = SkipList::with_parameters(branch_factor);
 
         for element in elements.iter() {
             skip_list.insert(element.clone());
@@ -514,10 +519,9 @@ mod test {
 
     #[quickcheck]
     fn check_concurrent_access(elements: Vec<Vec<int>>,
-                               max_height: u8,
                                branch_factor: u8) -> TestResult {
-        if max_height < 1 || branch_factor < 2 { return TestResult::discard() };
-        let skip_list = Arc::new(SkipList::with_parameters(max_height, branch_factor));
+        if branch_factor < 2 { return TestResult::discard() };
+        let skip_list = Arc::new(SkipList::with_parameters(branch_factor));
         let start_barrier = Arc::new(Barrier::new(elements.len() * 2));
         let end_barrier = Arc::new(Barrier::new(elements.len() * 2 + 1));
 
@@ -593,20 +597,14 @@ mod test {
 
     #[test]
     #[should_fail]
-    fn test_0_max_height() {
-        SkipList::<int>::with_parameters(0, 2);
-    }
-
-    #[test]
-    #[should_fail]
     fn test_0_branch_factor() {
-        SkipList::<int>::with_parameters(12, 0);
+        SkipList::<int>::with_parameters(0);
     }
 
     #[test]
     #[should_fail]
     fn test_1_branch_factor() {
-        SkipList::<int>::with_parameters(12, 1);
+        SkipList::<int>::with_parameters(1);
     }
 }
 
@@ -616,21 +614,26 @@ mod bench {
     use std::rand::{weak_rng, Rng};
     use test::{Bencher, black_box};
     use std::collections::TreeSet;
+    use std::io::MemWriter;
 
     use super::SkipList;
 
     /// Populate a btree set with `n` elements, and iterate through `m` elements starting at a
     /// random offset into the set.
     fn tree_seek_scan(n: uint, m: uint, b: &mut Bencher) {
-        let mut set = TreeSet::<uint>::new();
+        let mut set = TreeSet::<Vec<u8>>::new();
         let mut rng = weak_rng();
 
         for elem in rng.gen_iter().take(n) {
-            set.insert(elem);
+            let mut writer = MemWriter::new();
+            writer.write_le_u64(elem);
+            set.insert(writer.unwrap());
         }
 
         b.iter(|| {
-            for entry in set.lower_bound(&rng.gen()).take(m) {
+            let mut writer = MemWriter::new();
+            writer.write_le_u64(rng.gen());
+            for entry in set.lower_bound(&writer.unwrap()).take(m) {
                 black_box(entry);
             }
         });
@@ -639,15 +642,19 @@ mod bench {
     /// Populate a skip list with `n` elements, and iterate through `m` elements starting at a
     /// random offset into the set.
     fn skip_list_seek_scan(n: uint, m: uint, b: &mut Bencher) {
-        let set = SkipList::<uint>::new();
+        let set = SkipList::<Vec<u8>>::new();
         let mut rng = weak_rng();
 
         for elem in rng.gen_iter().take(n) {
-            set.insert(elem);
+            let mut writer = MemWriter::new();
+            writer.write_le_u64(elem);
+            set.insert(writer.unwrap());
         }
 
         b.iter(|| {
-            for entry in set.iter_from(&rng.gen()).take(m) {
+            let mut writer = MemWriter::new();
+            writer.write_le_u64(rng.gen());
+            for entry in set.iter_from(&writer.unwrap()).take(m) {
                 black_box(entry);
             }
         });
